@@ -1,0 +1,409 @@
+/**
+ * FixIt Now - Client Socket.IO Service
+ * Conforms to docs/SRS.md FR-C10..FR-C12, FR-P7..FR-P9, FR-T1, FR-T3 and docs/PLAN.md Phase 6.
+ *
+ * Manages WebSocket connection to backend for:
+ * - Partner dispatch calls (incoming request popup with countdown)
+ * - Real-time matching updates and "All partners busy" notification
+ * - Instant job acceptance & cancellation pushes
+ */
+
+import { io } from 'socket.io-client';
+
+const SOCKET_SERVER_URL =
+  import.meta.env.VITE_SOCKET_URL ||
+  import.meta.env.VITE_API_URL ||
+  'http://localhost:5001';
+
+let socket = null;
+
+/**
+ * Initializes and retrieves the singleton socket connection
+ */
+export function getSocket() {
+  if (!socket) {
+    socket = io(SOCKET_SERVER_URL, {
+      autoConnect: true,
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1000,
+      transports: ['websocket', 'polling'],
+    });
+
+    socket.on('connect', () => {
+      if (activePartnerId) {
+        registerPartner(activePartnerId);
+        return;
+      }
+      // Re-register session if stored
+      try {
+        const userRaw = localStorage.getItem('fixit_user');
+        if (userRaw) {
+          const user = JSON.parse(userRaw);
+          if (user.role === 'partner' && user.id) {
+            registerPartner(user.id);
+          } else if (user.role === 'customer' && user.id) {
+            registerCustomer(user.id);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    });
+
+    socket.on('logged_out', () => {
+      activePartnerId = null;
+      try {
+        localStorage.removeItem('fixit_token');
+        localStorage.removeItem('fixit_user');
+        localStorage.removeItem('fixit_role');
+        localStorage.removeItem('fixit_partner_user');
+        localStorage.removeItem('fixit_current_partner');
+      } catch {
+        // ignore
+      }
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('fixit_auth_change'));
+      }
+    });
+
+    socket.on('connect_error', (err) => {
+      console.warn('[Socket.IO Connection Error]:', err.message);
+    });
+  }
+
+  return socket;
+}
+
+let activePartnerId = null;
+
+/**
+ * Registers partner room
+ */
+export function registerPartner(partnerId) {
+  if (!partnerId) return;
+  activePartnerId = String(partnerId);
+  const s = getSocket();
+  const token = typeof localStorage !== 'undefined' ? localStorage.getItem('fixit_token') : null;
+  s.emit('register_partner', { partnerId: String(partnerId), token });
+}
+
+/**
+ * Registers customer room
+ */
+export function registerCustomer(customerId) {
+  if (!customerId) return;
+  const s = getSocket();
+  s.emit('register_customer', { customerId: String(customerId) });
+}
+
+/**
+ * Joins request room
+ */
+export function joinRequest(requestId) {
+  if (!requestId) return;
+  const s = getSocket();
+  s.emit('join_request', { requestId: String(requestId) });
+}
+
+/**
+ * Partner responds to an incoming request (Accept or Decline)
+ */
+export function respondToJob(requestId, partnerId, decision, reason = '') {
+  const s = getSocket();
+  const token = typeof localStorage !== 'undefined' ? localStorage.getItem('fixit_token') : null;
+  s.emit('partner_respond', {
+    requestId: String(requestId),
+    partnerId: String(partnerId),
+    decision,
+    reason,
+    token,
+  });
+}
+
+/**
+ * Explicitly disconnect socket (e.g. on partner logout)
+ */
+export function disconnectSocket() {
+  activePartnerId = null;
+  if (socket) {
+    socket.disconnect();
+    socket = null;
+  }
+}
+
+/**
+ * Customer cancels active request
+ */
+export function cancelJob(requestId, reason = 'Cancelled by customer') {
+  const s = getSocket();
+  s.emit('customer_cancel', {
+    requestId: String(requestId),
+    reason,
+  });
+}
+
+/**
+ * Subscribes to incoming request events (Partner side)
+ */
+export function onIncomingRequest(callback) {
+  const s = getSocket();
+  const handler = (data) => callback(data);
+  s.on('incoming_request', handler);
+  return () => s.off('incoming_request', handler);
+}
+
+/**
+ * Subscribes to request timeout events (Partner side)
+ */
+export function onRequestTimeout(callback) {
+  const s = getSocket();
+  const handler = (data) => callback(data);
+  s.on('request_timeout', handler);
+  return () => s.off('request_timeout', handler);
+}
+
+/**
+ * Subscribes to request cancellation events (Partner side or Customer side)
+ */
+export function onRequestCancelled(callback) {
+  const s = getSocket();
+  const handler = (data) => callback(data);
+  s.on('request_cancelled', handler);
+  return () => s.off('request_cancelled', handler);
+}
+
+/**
+ * Subscribes to request taken events (when another partner accepted the job)
+ */
+export function onRequestTaken(callback) {
+  const s = getSocket();
+  const handler = (data) => callback(data);
+  s.on('request_taken', handler);
+  return () => s.off('request_taken', handler);
+}
+
+/**
+ * Subscribes to request acceptance events (Customer side)
+ */
+export function onRequestAccepted(callback) {
+  const s = getSocket();
+  const handler = (data) => callback(data);
+  s.on('request_accepted', handler);
+  return () => s.off('request_accepted', handler);
+}
+
+/**
+ * Subscribes to request confirmed events (Partner side)
+ */
+export function onRequestConfirmed(callback) {
+  const s = getSocket();
+  const handler = (data) => callback(data);
+  s.on('request_confirmed', handler);
+  return () => s.off('request_confirmed', handler);
+}
+
+/**
+ * Subscribes to request status update events (Customer & Partner side)
+ */
+export function onRequestStatusUpdated(callback) {
+  const s = getSocket();
+  const handler = (data) => callback(data);
+  s.on('request_status_updated', handler);
+  return () => s.off('request_status_updated', handler);
+}
+
+/**
+ * Subscribes to searching progress updates
+ */
+export function onSearchingUpdate(callback) {
+  const s = getSocket();
+  const handler = (data) => callback(data);
+  s.on('searching_update', handler);
+  return () => s.off('searching_update', handler);
+}
+
+/**
+ * Subscribes to "all partners busy" state
+ */
+export function onAllPartnersBusy(callback) {
+  const s = getSocket();
+  const handler = (data) => callback(data);
+  s.on('all_partners_busy', handler);
+  return () => s.off('all_partners_busy', handler);
+}
+
+/**
+ * Partner emits request for customer to provide OTP
+ */
+export function requestOtpPrompt(requestId) {
+  if (!requestId) return;
+  const s = getSocket();
+  s.emit('partner_request_otp', { requestId: String(requestId) });
+}
+
+/**
+ * Customer subscribes to OTP popup event triggered when partner requests verification
+ */
+export function onOtpPrompt(callback) {
+  const s = getSocket();
+  const handler = (data) => callback(data);
+  s.on('otp_prompt_customer', handler);
+  return () => s.off('otp_prompt_customer', handler);
+}
+
+/**
+ * Subscribes to partner location & ETA movements (Customer and Partner side)
+ */
+export function onPartnerLocation(callback) {
+  const s = getSocket();
+  const handler = (data) => callback(data);
+  s.on('partner_location', handler);
+  s.on('partner_location_update', handler);
+  return () => {
+    s.off('partner_location', handler);
+    s.off('partner_location_update', handler);
+  };
+}
+
+/**
+ * Generic event listener on socket
+ */
+export function on(event, callback) {
+  const s = getSocket();
+  if (s && typeof s.on === 'function') {
+    s.on(event, callback);
+    return () => s.off(event, callback);
+  }
+  return () => {};
+}
+
+/**
+ * Generic event listener removal on socket
+ */
+export function off(event, callback) {
+  const s = getSocket();
+  if (s && typeof s.off === 'function') {
+    s.off(event, callback);
+  }
+}
+
+/**
+ * Registers admin room for real-time compliance events
+ */
+export function registerAdmin() {
+  const s = getSocket();
+  if (s) {
+    s.emit('register_admin');
+    s.emit('join_admin');
+  }
+}
+
+/**
+ * Subscribes to live KYC submissions (Admin side)
+ */
+export function onKycSubmitted(callback) {
+  const s = getSocket();
+  if (!s) return () => {};
+  const handler = (data) => callback(data);
+  s.on('kyc:submitted', handler);
+  return () => s.off('kyc:submitted', handler);
+}
+
+/**
+ * Subscribes to request offer dismissals (Partner side)
+ */
+export function onRequestDismiss(callback) {
+  const s = getSocket();
+  if (!s) return () => {};
+  const handler = (data) => callback(data);
+  s.on('request_dismiss', handler);
+  return () => s.off('request_dismiss', handler);
+}
+
+/**
+ * Subscribes to partner KYC status updates (Partner side)
+ */
+export function onKycStatusUpdated(callback) {
+  const s = getSocket();
+  if (!s) return () => {};
+  const handler = (data) => callback(data);
+  s.on('kyc:status_updated', handler);
+  return () => s.off('kyc:status_updated', handler);
+}
+
+/**
+ * Subscribes to payment completed events (Partner side)
+ */
+export function onPaymentCompleted(callback) {
+  const s = getSocket();
+  if (!s) return () => {};
+  const handler = (data) => callback(data);
+  s.on('payment_completed', handler);
+  return () => s.off('payment_completed', handler);
+}
+
+/**
+ * Subscribes to customer rating / review events (Partner side)
+ */
+export function onRatingSubmitted(callback) {
+  const s = getSocket();
+  if (!s) return () => {};
+  const handler = (data) => callback(data);
+  s.on('rating_submitted', handler);
+  s.on('review_received', handler);
+  s.on('rating_skipped', handler);
+  s.on('rating_status_updated', handler);
+  return () => {
+    s.off('rating_submitted', handler);
+    s.off('review_received', handler);
+    s.off('rating_skipped', handler);
+    s.off('rating_status_updated', handler);
+  };
+}
+
+/**
+ * Subscribes to customer rating skipped events
+ */
+export function onRatingSkipped(callback) {
+  const s = getSocket();
+  if (!s) return () => {};
+  const handler = (data) => callback(data);
+  s.on('rating_skipped', handler);
+  return () => {
+    s.off('rating_skipped', handler);
+  };
+}
+
+export default {
+  getSocket,
+  disconnectSocket,
+  registerPartner,
+  registerCustomer,
+  registerAdmin,
+  joinRequest,
+  respondToJob,
+  cancelJob,
+  requestOtpPrompt,
+  onOtpPrompt,
+  onIncomingRequest,
+  onRequestTimeout,
+  onRequestCancelled,
+  onRequestAccepted,
+  onRequestConfirmed,
+  onRequestStatusUpdated,
+  onRequestTaken,
+  onRequestDismiss,
+  onKycSubmitted,
+  onKycStatusUpdated,
+  onSearchingUpdate,
+  onAllPartnersBusy,
+  onPartnerLocation,
+  onPaymentCompleted,
+  onRatingSubmitted,
+  onRatingSkipped,
+  on,
+  off,
+};
+
+
