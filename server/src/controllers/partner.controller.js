@@ -1,0 +1,1377 @@
+/**
+ * FixIt Now - Partner Onboarding, Subscriptions & KYC Controller
+ * Conforms to docs/SRS.md FR-P1 to FR-P7, FR-P13 to FR-P15 and docs/PLAN.md Phase 4.
+ *
+ * Rules:
+ * - 0% commission flat-rate subscription models (quarterly, half-yearly, yearly).
+ * - Subscriptions store start and end dates and price paid at that time.
+ * - Lockout of job features when subscription is missing or expired.
+ * - Warning banner when plan is close to expiry (<= 7 days).
+ * - KYC documents (PDF) and passport photo (JPEG/PNG) stored outside public root.
+ * - Secure document serving strictly to document owner and admin.
+ * - KYC states: not_submitted, pending, verified, rejected.
+ */
+
+import fs from 'fs';
+import path from 'path';
+import { query } from '../config/db.js';
+import { KYC_UPLOAD_DIR } from '../middleware/upload.middleware.js';
+import { getIo, dismissPartnerOffers, handlePartnerLogout } from '../services/socket.service.js';
+import { geocodeAddress } from '../services/geocoding.service.js';
+import { logActivity } from './admin.controller.js';
+
+/**
+ * 1. Get Available Subscription Plans (SRS FR-P2)
+ * Longer duration = cheaper per month
+ */
+export async function getSubscriptionPlans(req, res, next) {
+  try {
+    const result = await query(
+      `SELECT id, name, duration_months, price, active
+       FROM plans
+       WHERE active = true
+       ORDER BY duration_months ASC`
+    );
+
+    const plans = result.rows.map((p) => ({
+      id: p.id,
+      name: p.name,
+      duration_months: p.duration_months,
+      price: parseFloat(p.price),
+      monthly_equivalent: Math.round(parseFloat(p.price) / p.duration_months),
+      active: p.active,
+    }));
+
+    return res.status(200).json({
+      status: 'success',
+      data: plans,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 2. Get Partner Subscription Details (SRS FR-P13, FR-P15)
+ */
+export async function getPartnerSubscription(req, res, next) {
+  try {
+    const partnerId = req.user.id;
+
+    const result = await query(
+      `SELECT s.id, s.partner_id, s.plan_id, s.price_paid, s.start_date, s.end_date, s.status, s.created_at,
+              p.name AS plan_name, p.duration_months, p.price AS current_plan_price
+       FROM subscriptions s
+       JOIN plans p ON s.plan_id = p.id
+       WHERE s.partner_id = $1
+       ORDER BY s.end_date DESC
+       LIMIT 1`,
+      [partnerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(200).json({
+        status: 'success',
+        is_subscribed: false,
+        is_locked: true,
+        data: null,
+      });
+    }
+
+    const sub = result.rows[0];
+    const now = new Date();
+    const endDate = new Date(sub.end_date);
+    const msRemaining = endDate.getTime() - now.getTime();
+    const daysRemaining = Math.max(0, Math.ceil(msRemaining / (1000 * 60 * 60 * 24)));
+
+    const isExpired = msRemaining <= 0;
+    const isExpiringSoon = !isExpired && daysRemaining <= 7;
+    const computedStatus = isExpired ? 'expired' : sub.status;
+
+    // If status in db is active but expired, update db
+    if (isExpired && sub.status === 'active') {
+      await query('UPDATE subscriptions SET status = $1 WHERE id = $2', ['expired', sub.id]);
+    }
+
+    return res.status(200).json({
+      status: 'success',
+      is_subscribed: !isExpired && computedStatus === 'active',
+      is_locked: isExpired || computedStatus !== 'active',
+      data: {
+        id: sub.id,
+        partner_id: sub.partner_id,
+        plan_id: sub.plan_id,
+        plan_name: sub.plan_name,
+        duration_months: sub.duration_months,
+        price_paid: parseFloat(sub.price_paid),
+        start_date: sub.start_date,
+        end_date: sub.end_date,
+        days_remaining: daysRemaining,
+        is_expiring_soon: isExpiringSoon,
+        status: computedStatus,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 3. Subscribe or Renew Subscription Plan (Simulated payment, SRS FR-P2, FR-P14)
+ */
+export async function subscribePlan(req, res, next) {
+  try {
+    const partnerId = req.user.id;
+    const { plan_id } = req.body;
+
+    const planIdNum = parseInt(plan_id, 10);
+    if (isNaN(planIdNum) || planIdNum <= 0) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Valid plan ID is required (SRS FR-P2).',
+      });
+    }
+
+    // Verify plan exists
+    const planResult = await query(
+      `SELECT id, name, duration_months, price, active
+       FROM plans
+       WHERE id = $1 AND active = true`,
+      [planIdNum]
+    );
+
+    if (planResult.rows.length === 0) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'The selected subscription plan does not exist or is inactive.',
+      });
+    }
+
+    const plan = planResult.rows[0];
+    const pricePaid = parseFloat(plan.price);
+
+    // Check for existing active subscription
+    const existingResult = await query(
+      `SELECT id, end_date, status
+       FROM subscriptions
+       WHERE partner_id = $1 AND status = 'active'
+       ORDER BY end_date DESC
+       LIMIT 1`,
+      [partnerId]
+    );
+
+    const now = new Date();
+    let startDate = now;
+
+    // If partner has active unexpired subscription, extension starts from existing end_date
+    if (existingResult.rows.length > 0) {
+      const existingEnd = new Date(existingResult.rows[0].end_date);
+      if (existingEnd > now) {
+        startDate = existingEnd;
+      }
+    }
+
+    const endDate = new Date(startDate);
+    endDate.setMonth(endDate.getMonth() + plan.duration_months);
+
+    // Insert new subscription record storing exact price paid at that time (SRS Section 6)
+    const insertResult = await query(
+      `INSERT INTO subscriptions (
+         partner_id, plan_id, price_paid, start_date, end_date, status
+       ) VALUES ($1, $2, $3, $4, $5, 'active')
+       RETURNING id, partner_id, plan_id, price_paid, start_date, end_date, status, created_at`,
+      [partnerId, plan.id, pricePaid, startDate.toISOString(), endDate.toISOString()]
+    );
+
+    const createdSub = insertResult.rows[0];
+    const msRemaining = endDate.getTime() - now.getTime();
+    const daysRemaining = Math.max(0, Math.ceil(msRemaining / (1000 * 60 * 60 * 24)));
+
+    return res.status(201).json({
+      status: 'success',
+      message: `Successfully subscribed to ${plan.name} pass (₹${pricePaid}). 0% commission active.`,
+      data: {
+        id: createdSub.id,
+        partner_id: createdSub.partner_id,
+        plan_id: plan.id,
+        plan_name: plan.name,
+        duration_months: plan.duration_months,
+        price_paid: pricePaid,
+        start_date: createdSub.start_date,
+        end_date: createdSub.end_date,
+        days_remaining: daysRemaining,
+        status: 'active',
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 4. Get Partner KYC Status & Documents (SRS FR-P4, FR-P5)
+ */
+export async function getPartnerKyc(req, res, next) {
+  try {
+    const partnerId = req.user.id;
+
+    // Fetch partner KYC status
+    const partnerRes = await query(
+      `SELECT id, name, kyc_status, rejection_reason, photo_url
+       FROM partners
+       WHERE id = $1`,
+      [partnerId]
+    );
+
+    if (partnerRes.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'Partner account not found.' });
+    }
+
+    const partner = partnerRes.rows[0];
+
+    // Fetch uploaded documents
+    const docsRes = await query(
+      `SELECT id, document_type, file_name, original_name, file_type, file_size,
+              status, reviewer_notes, reviewed_at, created_at
+       FROM kyc_documents
+       WHERE partner_id = $1
+       ORDER BY created_at DESC`,
+      [partnerId]
+    );
+
+    return res.status(200).json({
+      status: 'success',
+      data: {
+        partner_id: partner.id,
+        status: partner.kyc_status || 'not_submitted',
+        rejection_reason: partner.rejection_reason || null,
+        photo_url: partner.photo_url || null,
+        documents: docsRes.rows.map((d) => ({
+          id: d.id,
+          document_type: d.document_type,
+          file_name: d.file_name,
+          original_name: d.original_name,
+          file_type: d.file_type,
+          file_size: d.file_size,
+          status: d.status,
+          reviewer_notes: d.reviewer_notes,
+          reviewed_at: d.reviewed_at,
+          created_at: d.created_at,
+          download_url: `/api/partner/kyc/document/${d.id}`,
+        })),
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 5. Upload KYC Documents & Passport Photo (SRS FR-P4)
+ * Uses Multer; stores files outside any public folder
+ */
+export async function uploadPartnerKyc(req, res, next) {
+  try {
+    const partnerId = req.user.id;
+    const { govt_id_type, id_number } = req.body;
+
+    if (!govt_id_type?.trim()) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Government ID type is required (e.g., Aadhaar Card, Voter ID, Driving License).',
+      });
+    }
+
+    if (!id_number?.trim() || id_number.trim().length < 4) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'A valid Government ID number of at least 4 characters is required.',
+      });
+    }
+
+    const files = req.files || {};
+    const docFile = files.document ? files.document[0] : null;
+    const photoFile = files.photo ? files.photo[0] : null;
+    const tradeCertFile = files.trade_cert ? files.trade_cert[0] : null;
+
+    // Helper to cleanup newly uploaded files on disk if validation or DB operations fail
+    const cleanupUploadedFiles = () => {
+      [docFile, photoFile, tradeCertFile].forEach((f) => {
+        if (f && f.path && fs.existsSync(f.path)) {
+          try {
+            fs.unlinkSync(f.path);
+          } catch {
+            // ignore
+          }
+        }
+      });
+    };
+
+    // Server-side strict size limit enforcement (SRS Section 4)
+    if (photoFile && photoFile.size > 2 * 1024 * 1024) {
+      cleanupUploadedFiles();
+      return res.status(400).json({
+        status: 'error',
+        message: 'Passport photograph file size exceeds the 2MB limit (SRS Section 4).',
+      });
+    }
+
+    if (docFile && docFile.size > 5 * 1024 * 1024) {
+      cleanupUploadedFiles();
+      return res.status(400).json({
+        status: 'error',
+        message: 'Identity document file size exceeds the 5MB limit (SRS Section 4).',
+      });
+    }
+
+    if (tradeCertFile && tradeCertFile.size > 5 * 1024 * 1024) {
+      cleanupUploadedFiles();
+      return res.status(400).json({
+        status: 'error',
+        message: 'Trade certificate file size exceeds the 5MB limit (SRS Section 4).',
+      });
+    }
+
+    // Fetch partner profile to confirm existence and capture email & name for activity logging
+    const partnerRes = await query(
+      'SELECT id, name, email, service_id, kyc_status FROM partners WHERE id = $1',
+      [partnerId]
+    );
+    if (partnerRes.rows.length === 0) {
+      cleanupUploadedFiles();
+      return res.status(404).json({ status: 'error', message: 'Partner profile not found.' });
+    }
+    const partner = partnerRes.rows[0];
+
+    // Find any existing files so they can be deleted ONLY after the new upload succeeded
+    const existingDocs = await query(
+      'SELECT id, document_type, file_path FROM kyc_documents WHERE partner_id = $1',
+      [partnerId]
+    );
+    const oldFiles = existingDocs.rows.map((r) => r.file_path).filter(Boolean);
+    const oldDocIds = existingDocs.rows.map((r) => r.id);
+
+    // Initial submission and Re-KYC document requirements (same file rules as before: doc + photo required)
+    if (!docFile || !photoFile) {
+      cleanupUploadedFiles();
+      return res.status(400).json({
+        status: 'error',
+        message: 'Both an identity document (PDF) and a passport photo (JPEG/PNG) are required for KYC submission (SRS FR-P4).',
+      });
+    }
+
+    const insertedDocs = [];
+
+    // Save ID document
+    if (docFile) {
+      const docRes = await query(
+        `INSERT INTO kyc_documents (
+           partner_id, document_type, file_path, file_name, original_name, file_type, file_size, status
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+         RETURNING id, document_type, file_name, original_name, status, created_at`,
+        [
+          partnerId,
+          govt_id_type.trim(),
+          docFile.path,
+          docFile.filename,
+          docFile.originalname,
+          docFile.mimetype,
+          docFile.size,
+        ]
+      );
+      insertedDocs.push(docRes.rows[0]);
+    }
+
+    // Save passport photo & update photo_url on partner profile (SRS Section 6)
+    let photoDocId = null;
+    if (photoFile) {
+      const photoRes = await query(
+        `INSERT INTO kyc_documents (
+           partner_id, document_type, file_path, file_name, original_name, file_type, file_size, status
+         ) VALUES ($1, 'passport_photo', $2, $3, $4, $5, $6, 'pending')
+         RETURNING id, document_type, file_name, original_name, status, created_at`,
+        [
+          partnerId,
+          photoFile.path,
+          photoFile.filename,
+          photoFile.originalname,
+          photoFile.mimetype,
+          photoFile.size,
+        ]
+      );
+      insertedDocs.push(photoRes.rows[0]);
+      photoDocId = photoRes.rows[0].id;
+    }
+
+    // Save trade cert if provided
+    if (tradeCertFile) {
+      const tradeRes = await query(
+        `INSERT INTO kyc_documents (
+           partner_id, document_type, file_path, file_name, original_name, file_type, file_size, status
+         ) VALUES ($1, 'trade_certificate', $2, $3, $4, $5, $6, 'pending')
+         RETURNING id, document_type, file_name, original_name, status, created_at`,
+        [
+          partnerId,
+          tradeCertFile.path,
+          tradeCertFile.filename,
+          tradeCertFile.originalname,
+          tradeCertFile.mimetype,
+          tradeCertFile.size,
+        ]
+      );
+      insertedDocs.push(tradeRes.rows[0]);
+    }
+
+    // Update partner status to pending, clear prior rejection reason, and link photo_url
+    const photoUrl = photoDocId ? `/api/partner/kyc/document/${photoDocId}` : null;
+    await query(
+      `UPDATE partners
+       SET kyc_status = 'pending',
+           rejection_reason = NULL,
+           photo_url = COALESCE($1, photo_url),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2`,
+      [photoUrl, partnerId]
+    );
+
+    // Delete old database records and delete old physical files ONLY after the new upload succeeded
+    if (oldDocIds.length > 0) {
+      await query('DELETE FROM kyc_documents WHERE id = ANY($1)', [oldDocIds]);
+    }
+    oldFiles.forEach((fPath) => {
+      try {
+        if (fPath && fs.existsSync(fPath)) {
+          fs.unlinkSync(fPath);
+        }
+      } catch (unlinkErr) {
+        console.warn('[Re-KYC File Cleanup Warn]:', unlinkErr.message);
+      }
+    });
+
+    // Record an audit log in activity_logs
+    await logActivity(
+      partner.email || req.user?.email || `partner_${partnerId}`,
+      'KYC_SUBMITTED',
+      {
+        partner_id: partnerId,
+        partner_name: partner.name,
+        partner_email: partner.email,
+        govt_id_type: govt_id_type.trim(),
+        previous_status: partner.kyc_status,
+        new_status: 'pending',
+        documents_uploaded: insertedDocs.length,
+        submitted_at: new Date().toISOString(),
+      }
+    );
+
+    // Notify admin room via Socket.IO immediately without full page refresh
+    const io = getIo();
+    if (io) {
+      const kycEvent = {
+        partnerId,
+        partner_id: partnerId,
+        partnerName: partner.name,
+        partner_name: partner.name,
+        partnerEmail: partner.email,
+        partner_email: partner.email,
+        status: 'pending',
+        submittedAt: new Date().toISOString(),
+      };
+      io.to('admin').emit('kyc:submitted', kycEvent);
+      io.emit('kyc:submitted', kycEvent);
+
+      // Dismiss any open request popups on the partner's screen and update status to pending
+      io.to(`partner:${partnerId}`).emit('kyc:status_updated', { kyc_status: 'pending' });
+      io.to(`partner:${partnerId}`).emit('request_dismiss', { reason: 'KYC_PENDING' });
+    }
+
+    // Dismiss active job offers from in-memory dispatches
+    dismissPartnerOffers(partnerId);
+
+    return res.status(200).json({
+      status: 'success',
+      message: 'KYC documents successfully uploaded and submitted for administrator review (SRS FR-P5).',
+      data: {
+        kyc_status: 'pending',
+        documents_uploaded: insertedDocs.length,
+        documents: insertedDocs,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 6. Securely Serve KYC Documents (Owner and Admin Only)
+ * "Store files outside any public path and serve them only to the owner and the admin."
+ */
+export async function serveKycDocument(req, res, next) {
+  try {
+    const { docId } = req.params;
+    const requesterId = req.user.id;
+    const requesterRole = req.user.role;
+
+    const docIdNum = parseInt(docId, 10);
+    if (isNaN(docIdNum)) {
+      return res.status(400).json({ status: 'error', message: 'Invalid document ID.' });
+    }
+
+    const docResult = await query(
+      `SELECT id, partner_id, document_type, file_path, file_name, original_name, file_type
+       FROM kyc_documents
+       WHERE id = $1`,
+      [docIdNum]
+    );
+
+    if (docResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'Requested KYC document was not found.' });
+    }
+
+    const doc = docResult.rows[0];
+
+    // Authorization: Strict check that requester is either admin or the partner who owns the document
+    if (requesterRole !== 'admin' && String(requesterId) !== String(doc.partner_id)) {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Access denied. You do not have permission to view or download this compliance document.',
+      });
+    }
+
+    // Check file exists on disk
+    let targetPath = null;
+    if (doc.file_path && fs.existsSync(doc.file_path)) {
+      targetPath = path.resolve(doc.file_path);
+    } else if (doc.file_path) {
+      const candidates = [
+        path.resolve(process.cwd(), doc.file_path),
+        path.resolve(process.cwd(), 'server', doc.file_path),
+        path.resolve(KYC_UPLOAD_DIR, path.basename(doc.file_path)),
+      ];
+      for (const cand of candidates) {
+        if (fs.existsSync(cand)) {
+          targetPath = cand;
+          break;
+        }
+      }
+    }
+
+    if (targetPath && fs.existsSync(targetPath)) {
+      res.setHeader('Content-Type', doc.file_type || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `inline; filename="${doc.original_name || doc.file_name}"`);
+      return res.sendFile(targetPath);
+    }
+
+    // Fallback preview for seeded/mock records where physical file was not created on disk
+    const isImage = (doc.file_type || '').startsWith('image/') || (doc.original_name || '').match(/\.(jpg|jpeg|png)$/i);
+    const svgBadge = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="600" height="400" viewBox="0 0 600 400">
+        <rect width="600" height="400" fill="#F4EFEA" stroke="#121212" stroke-width="4"/>
+        <rect x="20" y="20" width="560" height="60" fill="#FF5E1E" stroke="#121212" stroke-width="2"/>
+        <text x="300" y="58" font-family="monospace" font-size="20" font-weight="bold" fill="#FBF8F5" text-anchor="middle">
+          FIXIT NOW · KYC COMPLIANCE RECORD
+        </text>
+        <circle cx="300" cy="150" r="40" fill="#121212"/>
+        <text x="300" y="162" font-family="monospace" font-size="32" fill="#FBF8F5" text-anchor="middle">${isImage ? '📷' : '📄'}</text>
+        <text x="300" y="220" font-family="monospace" font-size="16" font-weight="bold" fill="#121212" text-anchor="middle">
+          ${(doc.document_type || 'DOCUMENT').toUpperCase()}
+        </text>
+        <text x="300" y="245" font-family="monospace" font-size="13" fill="#666666" text-anchor="middle">
+          Original: ${doc.original_name || doc.file_name || 'Document on record'}
+        </text>
+        <text x="300" y="270" font-family="monospace" font-size="12" fill="#666666" text-anchor="middle">
+          Type: ${doc.file_type || (isImage ? 'image/jpeg' : 'application/pdf')} · Status: ${doc.status || 'Pending'}
+        </text>
+        <rect x="180" y="300" width="240" height="32" fill="#121212" />
+        <text x="300" y="322" font-family="monospace" font-size="12" font-weight="bold" fill="#00FF66" text-anchor="middle">
+          [SECURE VERIFICATION RECORD]
+        </text>
+      </svg>
+    `.trim();
+
+    res.setHeader('Content-Type', 'image/svg+xml');
+    res.setHeader('Content-Disposition', 'inline; filename="kyc_preview.svg"');
+    return res.status(200).send(svgBadge);
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 7. Get Partner Dashboard Summary (SRS Section 3.3, FR-P7)
+ */
+export async function getPartnerDashboard(req, res, next) {
+  try {
+    const partnerId = req.user.id;
+
+    // 1. Partner info
+    const partnerRes = await query(
+      `SELECT p.id, p.name, p.email, p.phone, p.address, p.service_id, s.name AS service_name,
+              p.vehicle, p.vehicle_type, p.latitude, p.longitude, p.kyc_status, p.rejection_reason,
+              p.online,
+              (SELECT ROUND(AVG(r.stars)::numeric, 2) FROM ratings r WHERE r.partner_id = p.id) AS rating,
+              p.total_jobs
+       FROM partners p
+       JOIN services s ON p.service_id = s.id
+       WHERE p.id = $1`,
+      [partnerId]
+    );
+
+    if (partnerRes.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'Partner profile not found.' });
+    }
+
+    const partner = partnerRes.rows[0];
+
+    // 2. Subscription info
+    const subRes = await query(
+      `SELECT s.id, s.plan_id, s.price_paid, s.start_date, s.end_date, s.status,
+              p.name AS plan_name, p.duration_months
+       FROM subscriptions s
+       JOIN plans p ON s.plan_id = p.id
+       WHERE s.partner_id = $1
+       ORDER BY s.end_date DESC
+       LIMIT 1`,
+      [partnerId]
+    );
+
+    let subscription = null;
+    let isSubscribed = false;
+    let isLocked = true;
+    let isExpiringSoon = false;
+    let daysRemaining = 0;
+
+    if (subRes.rows.length > 0) {
+      const sub = subRes.rows[0];
+      const now = new Date();
+      const endDate = new Date(sub.end_date);
+      const msRemaining = endDate.getTime() - now.getTime();
+      daysRemaining = Math.max(0, Math.ceil(msRemaining / (1000 * 60 * 60 * 24)));
+
+      const isExpired = msRemaining <= 0;
+      isExpiringSoon = !isExpired && daysRemaining <= 7;
+      const computedStatus = isExpired ? 'expired' : sub.status;
+
+      isSubscribed = !isExpired && computedStatus === 'active';
+      isLocked = !isSubscribed;
+
+      subscription = {
+        id: sub.id,
+        plan_id: sub.plan_id,
+        plan_name: sub.plan_name,
+        duration_months: sub.duration_months,
+        price_paid: parseFloat(sub.price_paid),
+        start_date: sub.start_date,
+        end_date: sub.end_date,
+        days_remaining: daysRemaining,
+        is_expiring_soon: isExpiringSoon,
+        status: computedStatus,
+      };
+    }
+
+    // 3. KYC summary
+    const docsRes = await query(
+      `SELECT id, document_type, original_name, status, created_at
+       FROM kyc_documents
+       WHERE partner_id = $1
+       ORDER BY created_at DESC`,
+      [partnerId]
+    );
+
+    return res.status(200).json({
+      status: 'success',
+      data: {
+        partner: {
+          id: partner.id,
+          name: partner.name,
+          email: partner.email,
+          phone: partner.phone,
+          address: partner.address,
+          service_id: partner.service_id,
+          service_name: partner.service_name,
+          vehicle: partner.vehicle,
+          vehicle_type: partner.vehicle_type || 'bike_scooter',
+          online: partner.online,
+          rating: partner.rating != null ? parseFloat(partner.rating) : null,
+          total_jobs: partner.total_jobs,
+          kyc_status: partner.kyc_status || 'not_submitted',
+          rejection_reason: partner.rejection_reason || null,
+        },
+        subscription,
+        kyc: {
+          status: partner.kyc_status || 'not_submitted',
+          rejection_reason: partner.rejection_reason || null,
+          documents: docsRes.rows,
+        },
+        stats: {
+          today_jobs: 0,
+          today_earnings: 0.0,
+          total_jobs: partner.total_jobs,
+          rating: partner.rating != null ? parseFloat(partner.rating) : null,
+        },
+        is_subscribed: isSubscribed,
+        is_locked: isLocked,
+        warning_expiry: isExpiringSoon,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 8. Admin KYC Decision / Review (SRS FR-A4, FR-P5)
+ * Allows Admin (or simulated review) to verify or reject partner KYC
+ */
+export async function reviewPartnerKyc(req, res, next) {
+  try {
+    const { partnerId } = req.params;
+    const { decision, rejection_reason, reviewer_notes } = req.body;
+
+    if (!['verified', 'rejected'].includes(decision)) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Decision must be either "verified" or "rejected" (SRS FR-P5).',
+      });
+    }
+
+    if (decision === 'rejected' && !rejection_reason?.trim()) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'A rejection reason is required when rejecting KYC documents (SRS FR-P5).',
+      });
+    }
+
+    // Verify partner exists (with UUID format check)
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(partnerId);
+    if (!isUuid) {
+      return res.status(404).json({ status: 'error', message: 'Partner not found.' });
+    }
+
+    const check = await query('SELECT id, name FROM partners WHERE id = $1', [partnerId]);
+    if (check.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'Partner not found.' });
+    }
+
+    const cleanReason = decision === 'rejected' ? rejection_reason.trim() : null;
+
+    // Update partner status
+    await query(
+      `UPDATE partners
+       SET kyc_status = $1,
+           rejection_reason = $2,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $3`,
+      [decision, cleanReason, partnerId]
+    );
+
+    // Update documents status
+    await query(
+      `UPDATE kyc_documents
+       SET status = $1,
+           reviewer_notes = $2,
+           reviewed_at = CURRENT_TIMESTAMP
+       WHERE partner_id = $3`,
+      [decision, reviewer_notes?.trim() || cleanReason, partnerId]
+    );
+
+    // Audit decision in activity_logs (SRS Section 5 Auditability)
+    try {
+      const partnerName = check.rows[0]?.name || 'Partner';
+      await query(
+        `INSERT INTO activity_logs (actor, action, details, created_at)
+         VALUES ($1, $2, $3, CURRENT_TIMESTAMP)`,
+        [
+          req.user?.email || 'admin@fixitnow.com',
+          decision === 'verified' ? 'KYC_APPROVED' : 'KYC_REJECTED',
+          JSON.stringify({
+            partner_id: partnerId,
+            partner_name: partnerName,
+            decision,
+            rejection_reason: cleanReason,
+            reviewer_notes: reviewer_notes?.trim() || null,
+          }),
+        ]
+      );
+    } catch (auditErr) {
+      console.error('[KYC Audit Log Error]:', auditErr.message);
+    }
+
+    // Emit live status update to partner's client room
+    const io = getIo();
+    if (io) {
+      io.to(`partner:${partnerId}`).emit('kyc:status_updated', {
+        kyc_status: decision,
+        rejection_reason: cleanReason,
+      });
+    }
+
+    return res.status(200).json({
+      status: 'success',
+      message: `Partner KYC has been ${decision === 'verified' ? 'verified & approved' : 'rejected with reason'}.`,
+      data: {
+        partner_id: partnerId,
+        kyc_status: decision,
+        rejection_reason: cleanReason,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 9. Toggle Partner Online/Offline Status (SRS FR-P8)
+ * Strict Rule Check: Partner MUST be KYC-verified and hold an active subscription (BR-4, BR-5, FR-P7, FR-M3).
+ */
+export async function togglePartnerOnline(req, res, next) {
+  try {
+    const partnerId = req.user.id;
+
+    const partnerRes = await query(
+      'SELECT id, name, kyc_status, online, address, latitude, longitude FROM partners WHERE id = $1',
+      [partnerId]
+    );
+
+    if (partnerRes.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'Partner profile not found.' });
+    }
+
+    const partner = partnerRes.rows[0];
+
+    // If attempting to go online, enforce KYC and active subscription guards
+    if (!partner.online) {
+      if (partner.kyc_status !== 'verified') {
+        return res.status(403).json({
+          status: 'error',
+          message: 'KYC verification is required before you can go online to receive requests (SRS FR-P7, BR-5, FR-M3).',
+        });
+      }
+
+      const subRes = await query(
+        `SELECT id, status, end_date FROM subscriptions
+         WHERE partner_id = $1 AND status = 'active' AND end_date > CURRENT_TIMESTAMP
+         ORDER BY end_date DESC LIMIT 1`,
+        [partnerId]
+      );
+
+      if (subRes.rows.length === 0) {
+        return res.status(403).json({
+          status: 'error',
+          message: 'Active subscription pass is required before you can go online (SRS FR-P3, BR-4, FR-M3).',
+        });
+      }
+    }
+
+    const newOnlineState = !partner.online;
+    let lat = partner.latitude;
+    let lon = partner.longitude;
+
+    // Ensure partner coordinates are accurate when turning online
+    if (newOnlineState && (lat == null || lon == null || Number.isNaN(Number(lat)) || Number.isNaN(Number(lon)) || (Number(lat) === 0 && Number(lon) === 0))) {
+      const geo = await geocodeAddress(partner.address || '');
+      if (geo && geo.latitude != null && geo.longitude != null) {
+        lat = geo.latitude;
+        lon = geo.longitude;
+      }
+    }
+
+    await query('UPDATE partners SET online = $1, latitude = COALESCE($2, latitude), longitude = COALESCE($3, longitude), updated_at = CURRENT_TIMESTAMP WHERE id = $4', [
+      newOnlineState,
+      lat,
+      lon,
+      partnerId,
+    ]);
+
+    return res.status(200).json({
+      status: 'success',
+      online: newOnlineState,
+      partner: {
+        id: partner.id,
+        name: partner.name,
+        kyc_status: partner.kyc_status,
+        online: newOnlineState,
+      },
+      message: newOnlineState
+        ? '● You are now ONLINE — listening for dispatches in 2 km.'
+        : '○ You are now OFFLINE — radar paused.',
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 10. Admin: Get all Partner KYC dossiers for review (SRS FR-A4)
+ */
+export async function getAdminKycList(req, res, next) {
+  try {
+    const { status } = req.query;
+
+    let queryText = `
+      SELECT 
+        p.id AS partner_id,
+        p.name AS partner_name,
+        p.email AS partner_email,
+        p.phone AS partner_phone,
+        p.address AS partner_address,
+        p.vehicle AS partner_vehicle,
+        p.vehicle_type AS partner_vehicle_type,
+        (SELECT ROUND(AVG(r.stars)::numeric, 2) FROM ratings r WHERE r.partner_id = p.id) AS partner_rating,
+        p.kyc_status AS status,
+        p.rejection_reason,
+        p.photo_url,
+        p.updated_at,
+        p.created_at,
+        s.name AS service_name,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'id', d.id,
+              'document_type', d.document_type,
+              'original_name', d.original_name,
+              'file_name', d.file_name,
+              'file_type', d.file_type,
+              'file_size', d.file_size,
+              'status', d.status,
+              'reviewer_notes', d.reviewer_notes,
+              'created_at', d.created_at,
+              'download_url', '/api/partner/kyc/document/' || d.id
+            ) ORDER BY d.created_at DESC
+          ) FILTER (WHERE d.id IS NOT NULL),
+          '[]'
+        ) AS documents
+      FROM partners p
+      LEFT JOIN services s ON p.service_id = s.id
+      LEFT JOIN kyc_documents d ON p.id = d.partner_id
+      WHERE (p.kyc_status != 'not_submitted' OR d.id IS NOT NULL)
+    `;
+
+    const params = [];
+    if (status && ['pending', 'verified', 'rejected'].includes(status)) {
+      params.push(status);
+      queryText += ` AND p.kyc_status = $1`;
+    }
+
+    queryText += ` GROUP BY p.id, s.name ORDER BY p.updated_at DESC`;
+
+    const result = await query(queryText, params);
+
+    const dossiers = result.rows.map((row) => {
+      const docs = row.documents || [];
+      const govtDoc = docs.find(
+        (d) => d.document_type !== 'passport_photo' && d.document_type !== 'trade_certificate'
+      ) || docs[0];
+      const photoDoc = docs.find((d) => d.document_type === 'passport_photo');
+      const tradeDoc = docs.find((d) => d.document_type === 'trade_certificate');
+
+      return {
+        id: govtDoc?.id || row.partner_id,
+        partner_id: row.partner_id,
+        partner_name: row.partner_name,
+        partner_email: row.partner_email,
+        partner_phone: row.partner_phone,
+        service_name: row.service_name || 'General Repairs',
+        partner_address: row.partner_address || 'Not Specified',
+        partner_vehicle: row.partner_vehicle || 'Two-Wheeler',
+        partner_rating: row.partner_rating != null ? parseFloat(row.partner_rating) : null,
+        status: row.status,
+        rejection_reason: row.rejection_reason,
+        reviewer_decision: row.rejection_reason
+          ? `Rejected: ${row.rejection_reason}`
+          : row.status === 'verified'
+          ? 'Approved: Government ID and credentials verified'
+          : null,
+        govt_id_type: govtDoc?.document_type || 'Government ID',
+        id_number: 'Submitted on File',
+        document_name: govtDoc?.original_name || 'Govt_ID.pdf',
+        document_url: govtDoc ? `/api/partner/kyc/document/${govtDoc.id}` : null,
+        photo_name: photoDoc?.original_name || 'Passport_Photo.jpg',
+        photo_url: photoDoc ? `/api/partner/kyc/document/${photoDoc.id}` : null,
+        trade_cert_name: tradeDoc ? tradeDoc.original_name : 'Not Provided',
+        trade_cert_url: tradeDoc ? `/api/partner/kyc/document/${tradeDoc.id}` : null,
+        documents: docs,
+        submitted_at: govtDoc?.created_at || row.updated_at || row.created_at,
+      };
+    });
+
+    return res.status(200).json({
+      status: 'success',
+      data: dossiers,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 10. Get Partner Ratings & Customer Reviews (SRS FR-P11)
+ */
+export async function getPartnerRatings(req, res, next) {
+  try {
+    const partnerId = req.user?.id || req.query.partner_id;
+
+    let queryText = `
+      SELECT rat.id, rat.stars, rat.comment, rat.review_line, rat.feedback, rat.created_at AS date,
+              rat.request_id,
+              rat.partner_id,
+              c.name AS customer_name,
+              s.name AS service_name,
+              req.id AS order_id
+       FROM ratings rat
+       JOIN requests req ON rat.request_id = req.id
+       JOIN customers c ON req.customer_id = c.id
+       JOIN services s ON req.service_id = s.id
+    `;
+    const params = [];
+
+    if (
+      partnerId &&
+      typeof partnerId === 'string' &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(partnerId)
+    ) {
+      params.push(partnerId);
+      queryText += ` WHERE rat.partner_id = $1`;
+    } else {
+      queryText += ` WHERE rat.partner_id IS NULL`;
+    }
+
+    queryText += ` ORDER BY rat.created_at DESC LIMIT 50`;
+
+    const allRatingsRes = await query(queryText, params);
+    const rows = allRatingsRes.rows;
+
+    const reviews = rows.map((r) => {
+      const orderNum = `ORD-${String(r.order_id).replace(/-/g, '').slice(0, 4).toUpperCase()}`;
+      return {
+        id: r.id,
+        order_number: orderNum,
+        order_id: orderNum,
+        customer_name: r.customer_name,
+        stars: r.stars,
+        date: r.date,
+        comment: r.comment,
+        review_line: r.review_line || r.comment,
+        feedback: r.feedback || null,
+        service_name: r.service_name,
+      };
+    });
+
+    const breakdown = { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
+    let sum = 0;
+    reviews.forEach((r) => {
+      const s = Math.max(1, Math.min(5, r.stars));
+      breakdown[s] = (breakdown[s] || 0) + 1;
+      sum += s;
+    });
+
+    const total = reviews.length;
+    const avg = total > 0 ? parseFloat((sum / total).toFixed(2)) : null;
+
+    return res.status(200).json({
+      status: 'success',
+      data: {
+        partner_id: partnerId || null,
+        average: avg,
+        average_rating: avg,
+        total_reviews: total,
+        breakdown,
+        distribution: breakdown,
+        recent_reviews: reviews,
+        reviews,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 11. Get Partner Earnings & Payout Breakdown (SRS FR-P12, BR-7)
+ * Updated ONLY after payment is marked received.
+ * Breakdown by day and service.
+ * Respects user rule: Do not expose raw monetary earnings in payouts.
+ */
+export async function getPartnerEarnings(req, res, next) {
+  try {
+    const partnerId = req.user?.id || req.query.partner_id;
+    if (!partnerId) {
+      return res.status(400).json({ status: 'error', message: 'Partner ID is required.' });
+    }
+
+    const result = await query(
+      `SELECT r.id, r.problem, r.description, r.address, r.status, r.created_at, r.updated_at,
+              s.name AS service_name, s.base_price_estimate,
+              c.name AS customer_name, c.phone AS customer_phone,
+              p.amount, p.payment_method, p.receipt_no, p.created_at AS payment_date
+       FROM requests r
+       JOIN services s ON r.service_id = s.id
+       JOIN customers c ON r.customer_id = c.id
+       LEFT JOIN LATERAL (
+         SELECT amount, payment_method, receipt_no, created_at
+         FROM payments
+         WHERE request_id = r.id AND (status IN ('successful', 'completed', 'paid') OR status IS NULL)
+         ORDER BY created_at DESC
+         LIMIT 1
+       ) p ON true
+       WHERE r.partner_id = $1 
+         AND r.status IN ('completed', 'payment_completed')
+       ORDER BY r.updated_at DESC`,
+      [partnerId]
+    );
+
+    const rows = result.rows;
+    const totalJobs = rows.length;
+
+    const now = new Date();
+    const todayStr = now.toISOString().slice(0, 10);
+    const startOfWeek = new Date(now);
+    startOfWeek.setDate(now.getDate() - now.getDay());
+    startOfWeek.setHours(0, 0, 0, 0);
+
+    let todayJobs = 0;
+    let thisWeekJobs = 0;
+
+    const dayMap = {};
+    const serviceMap = {};
+
+    const ledger = rows.map((row) => {
+      const orderNum = `ORD-${String(row.id).replace(/-/g, '').slice(0, 4).toUpperCase()}`;
+      const jobDate = new Date(row.updated_at || row.created_at);
+      const dayKey = jobDate.toLocaleDateString('en-IN', {
+        day: 'numeric',
+        month: 'short',
+        year: 'numeric',
+      });
+
+      if (jobDate.toISOString().slice(0, 10) === todayStr) {
+        todayJobs += 1;
+      }
+      if (jobDate >= startOfWeek) {
+        thisWeekJobs += 1;
+      }
+
+      dayMap[dayKey] = (dayMap[dayKey] || 0) + 1;
+      serviceMap[row.service_name] = (serviceMap[row.service_name] || 0) + 1;
+
+      return {
+        id: row.id,
+        order_number: orderNum,
+        customer_name: row.customer_name,
+        service_name: row.service_name,
+        problem: row.problem,
+        payment_mode: row.payment_method || 'Direct UPI / Cash (On-site)',
+        date: row.payment_date || row.updated_at || row.created_at,
+        receipt_no: row.receipt_no,
+        status: 'payment_received',
+      };
+    });
+
+    const breakdownByDay = Object.entries(dayMap).map(([date, count]) => ({
+      date,
+      count,
+      label: `${count} job${count > 1 ? 's' : ''}`,
+    }));
+
+    const breakdownByService = Object.entries(serviceMap).map(([service, count]) => ({
+      service,
+      count,
+      label: `${count} job${count > 1 ? 's' : ''}`,
+    }));
+
+    return res.status(200).json({
+      status: 'success',
+      data: {
+        partner_id: partnerId,
+        total_jobs: totalJobs,
+        today_jobs: todayJobs,
+        this_week_jobs: thisWeekJobs,
+        breakdown_by_day: breakdownByDay,
+        breakdown_by_service: breakdownByService,
+        ledger,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 12. Get Partner Profile (SRS FR-P1, FR-P11)
+ */
+export async function getPartnerProfile(req, res, next) {
+  try {
+    const partnerId = req.user.id;
+
+    const result = await query(
+      `SELECT p.id, p.name, p.email, p.phone, p.service_id, s.name AS service_name,
+              p.vehicle, p.vehicle_type, p.address, p.latitude, p.longitude, p.online,
+              p.kyc_status, p.rejection_reason, p.photo_url, p.rating, p.total_jobs, p.badge,
+              p.created_at
+       FROM partners p
+       LEFT JOIN services s ON p.service_id = s.id
+       WHERE p.id = $1`,
+      [partnerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'Partner profile not found.' });
+    }
+
+    const row = result.rows[0];
+    return res.status(200).json({
+      status: 'success',
+      data: {
+        ...row,
+        rating: parseFloat(row.rating) || 5.0,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 13. Update Partner Profile (SRS FR-P1, FR-P11)
+ * Certified trade category is strictly locked per SRS FR-P1.
+ */
+export async function updatePartnerProfile(req, res, next) {
+  try {
+    const partnerId = req.user.id;
+    const { name, phone, address, vehicle } = req.body;
+
+    // Validate inputs
+    const cleanName = name ? String(name).trim() : null;
+    const cleanPhone = phone ? String(phone).trim() : null;
+    const cleanAddress = address ? String(address).trim() : null;
+    const cleanVehicle = vehicle ? String(vehicle).trim() : null;
+
+    if (!cleanName || cleanName.length < 2) {
+      return res.status(400).json({ status: 'error', message: 'Legal name must be at least 2 characters.' });
+    }
+    if (!cleanPhone || cleanPhone.length < 7) {
+      return res.status(400).json({ status: 'error', message: 'A valid registered phone number is required.' });
+    }
+    if (!cleanAddress || cleanAddress.length < 5) {
+      return res.status(400).json({ status: 'error', message: 'Base operating station and address is required.' });
+    }
+
+    const validVehicleTypes = ['bike_scooter', 'car'];
+    if (!req.body.vehicle_type || !validVehicleTypes.includes(req.body.vehicle_type)) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Vehicle type is required and must be one of: bike_scooter, car.',
+      });
+    }
+    const cleanVehicleType = req.body.vehicle_type;
+
+    // Geocode updated operating station address or use supplied coordinates
+    let lat = req.body.latitude != null ? Number(req.body.latitude) : null;
+    let lon = req.body.longitude != null ? Number(req.body.longitude) : null;
+    if (lat == null || lon == null || Number.isNaN(lat) || Number.isNaN(lon) || (lat === 0 && lon === 0)) {
+      const geo = await geocodeAddress(cleanAddress);
+      if (!geo || geo.latitude == null || geo.longitude == null) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Address could not be found. Please add a nearby landmark or the pincode.',
+        });
+      }
+      lat = geo.latitude;
+      lon = geo.longitude;
+    }
+
+    // Update partner record (trade category service_id is locked per SRS FR-P1)
+    const updateRes = await query(
+      `UPDATE partners
+       SET name = $1, phone = $2, address = $3, vehicle = COALESCE($4, vehicle, 'Service Vehicle'), latitude = $5, longitude = $6,
+           vehicle_type = $8, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $7
+       RETURNING id, name, email, phone, service_id, vehicle, vehicle_type, address, latitude, longitude,
+                 online, kyc_status, rejection_reason, photo_url, rating, total_jobs, badge, created_at`,
+      [cleanName, cleanPhone, cleanAddress, cleanVehicle, lat, lon, partnerId, cleanVehicleType]
+    );
+
+    if (updateRes.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'Partner profile not found.' });
+    }
+
+    // Fetch service_name
+    const serviceRes = await query(`SELECT name FROM services WHERE id = $1`, [updateRes.rows[0].service_id]);
+    const serviceName = serviceRes.rows[0]?.name || 'Home Service';
+
+    const profileData = {
+      ...updateRes.rows[0],
+      service_name: serviceName,
+      rating: parseFloat(updateRes.rows[0].rating) || 5.0,
+    };
+
+    return res.status(200).json({
+      status: 'success',
+      message: 'Partner profile updated successfully.',
+      data: profileData,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * Partner Logout (SRS Fix 3)
+ * Atomically sets online = false, increments session_version,
+ * disconnects active sockets, dismisses open job offers without touching active jobs,
+ * and emits logged_out to any other open tabs.
+ */
+export async function logoutPartner(req, res, next) {
+  try {
+    const partnerId = req.user.id;
+
+    // 1. Atomically set online = false and increment session_version
+    const result = await query(
+      `UPDATE partners
+       SET online = false,
+           session_version = session_version + 1,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING id, online, session_version`,
+      [partnerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'Partner not found.' });
+    }
+
+    // 2. Disconnect partner sockets, dismiss open offers, emit logged_out
+    handlePartnerLogout(partnerId);
+
+    return res.status(200).json({
+      status: 'success',
+      message: 'Partner logged out successfully. Radar is now offline.',
+      data: {
+        partnerId,
+        online: false,
+        session_version: result.rows[0].session_version,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export default {
+  getSubscriptionPlans,
+  getPartnerSubscription,
+  subscribePlan,
+  getPartnerKyc,
+  uploadPartnerKyc,
+  serveKycDocument,
+  getPartnerDashboard,
+  reviewPartnerKyc,
+  togglePartnerOnline,
+  getAdminKycList,
+  getPartnerRatings,
+  getPartnerEarnings,
+  getPartnerProfile,
+  updatePartnerProfile,
+  logoutPartner,
+};
+
